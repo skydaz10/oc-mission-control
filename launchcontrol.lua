@@ -32,8 +32,24 @@ local os = require("os")
 local computer = require("computer")
 local serialization = require("serialization")
 
-local SCRIPT_VERSION = "0.1.0"
+local SCRIPT_VERSION = "0.2.0"
 local UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/skydaz10/oc-mission-control/main/manifest.lua"
+
+local function loadConfig()
+  local ok, cfg = pcall(function()
+    local fn = loadfile("/home/node_config.lua")
+    if not fn then return nil end
+    local res = fn()
+    if type(res) == "table" then return res end
+    return nil
+  end)
+  if ok then return cfg end
+end
+
+local CFG = loadConfig() or {}
+if type(CFG.UPDATE_MANIFEST_URL) == "string" and CFG.UPDATE_MANIFEST_URL ~= "" then
+  UPDATE_MANIFEST_URL = CFG.UPDATE_MANIFEST_URL
+end
 
 local rs = component.redstone
 local modem = component.isAvailable("modem") and component.modem or nil
