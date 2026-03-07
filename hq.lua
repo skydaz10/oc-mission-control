@@ -8,7 +8,7 @@ local serialization = require("serialization")
 local term = require("term")
 
 local SCRIPT_VERSION = "0.1.0"
-local UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/<USER>/<REPO>/main/manifest.lua"
+local UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/skydaz10/oc-mission-control/main/manifest.lua"
 
 local modem = component.isAvailable("modem") and component.modem or nil
 local tunnel = component.isAvailable("tunnel") and component.tunnel or nil
