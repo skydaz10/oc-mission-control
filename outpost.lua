@@ -10,7 +10,7 @@ local os = require("os")
 local serialization = require("serialization")
 local term = require("term")
 
-local SCRIPT_VERSION = "0.2.0"
+local SCRIPT_VERSION = "0.2.1"
 local UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/skydaz10/oc-mission-control/main/manifest.lua"
 
 local function loadConfig()
@@ -71,10 +71,17 @@ local HOME_RETRY_PERIOD = 5.0
 local HOME_RETRY_MAX_SECONDS = 120.0
 
 -- Cargo operation tuning
-local UNLOAD_TIMEOUT = 600.0
+local UNLOAD_TIMEOUT = 90.0
 local LOAD_TIMEOUT = 300.0
 local DOCK_SETTLE_SECONDS = 2.0
 local RETRY_BACKOFF_SECONDS = 10.0
+
+-- Blocked handling
+local BLOCKED_RECALL_SECONDS = 600.0 -- auto recall after 10 minutes from first unload attempt
+
+-- Apply config overrides (timing)
+if type(CFG.UNLOAD_TIMEOUT) == "number" then UNLOAD_TIMEOUT = CFG.UNLOAD_TIMEOUT end
+if type(CFG.BLOCKED_RECALL_SECONDS) == "number" then BLOCKED_RECALL_SECONDS = CFG.BLOCKED_RECALL_SECONDS end
 
 ------------------------------------------------
 -- COMPONENTS
@@ -184,11 +191,45 @@ local homePending = false
 local lastHomeSendAt = 0
 local homeFirstSendAt = 0
 local lastHomeMsgId = nil
+local recentHomeMsgIds = {}
+local lastHomeExtra = nil
 
 local missionProcessing = false
 local missionNextAttemptAt = 0
 
+local blockedSince = 0
+local blockedReason = nil
+local suspended = false
+
 local function now() return computer.uptime() end
+
+local function resetBlockedState()
+  blockedSince = 0
+  blockedReason = nil
+end
+
+local function recordFirstUnloadAttempt()
+  if blockedSince == 0 then
+    blockedSince = now()
+  end
+end
+
+local function homeMsgIdRemember(id)
+  if type(id) ~= "string" or id == "" then return end
+  recentHomeMsgIds[#recentHomeMsgIds + 1] = id
+  if #recentHomeMsgIds > 5 then
+    table.remove(recentHomeMsgIds, 1)
+  end
+end
+
+local function homeMsgIdMatches(id)
+  if not id then return false end
+  if lastHomeMsgId and id == lastHomeMsgId then return true end
+  for _, v in ipairs(recentHomeMsgIds) do
+    if v == id then return true end
+  end
+  return false
+end
 
 local function msgId()
   return tostring(math.floor(now() * 1000)) .. "-" .. tostring(math.random(100000, 999999))
@@ -357,6 +398,11 @@ local function hello(force)
         outpostId = OUTPOST_ID,
         docked = isDocked(),
         statusLine = statusLine,
+        stage = missionStage,
+        missionId = currentMissionId,
+        blockedReason = blockedReason,
+        blockedSince = blockedSince,
+        suspended = suspended,
         padFreq = cachedPadFreq,
         padFreqValid = cachedPadFreqValid,
         dstFreqCtrl = cachedDstFreq,
@@ -383,6 +429,9 @@ local function status(reason)
         statusLine = statusLine,
         stage = missionStage,
         missionId = currentMissionId,
+        blockedReason = blockedReason,
+        blockedSince = blockedSince,
+        suspended = suspended,
         itemCells = ic,
         fluidCells = fc,
         padFreq = cachedPadFreq,
@@ -398,6 +447,7 @@ end
 
 local function requestPickup(manual)
   pollFreq()
+  if suspended and not manual then return end
   if cachedPadFreqValid ~= true then
     statusLine = "Fix pad frequency first"
     requestPending = false
@@ -478,18 +528,26 @@ local function sendPickupRequest()
   lastPickupSendAt = now()
 end
 
-local function sendHomeInbound()
+local function sendHomeInbound(extra)
   statusLine = "HOME_INBOUND sent"
   local mid = currentMissionId or lastMissionId
 
   lastHomeMsgId = msgId()
+  homeMsgIdRemember(lastHomeMsgId)
   if not homePending then
     homeFirstSendAt = now()
   end
   homePending = true
   lastHomeSendAt = now()
 
-  broadcast({kind = "HOME_INBOUND", msgId = lastHomeMsgId, to = "HQ", payload = {outpostId = OUTPOST_ID, missionId = mid}})
+  local payload = {outpostId = OUTPOST_ID, missionId = mid}
+  if type(extra) == "table" then
+    lastHomeExtra = extra
+  end
+  if type(lastHomeExtra) == "table" then
+    for k, v in pairs(lastHomeExtra) do payload[k] = v end
+  end
+  broadcast({kind = "HOME_INBOUND", msgId = lastHomeMsgId, to = "HQ", payload = payload})
 end
 
 local function triggerLaunchHome()
@@ -542,29 +600,74 @@ local function unloadRocket()
   safeSetEnabled(cargoUnloader, true)
 
   local emptyConfirm = 0
+  local notFoundConfirm = 0
   local start = now()
   while now() - start < UNLOAD_TIMEOUT do
     local ok, success, st = pcall(function() return cargoUnloader.getInvStatus() end)
     if ok and st == "TARGET_EMPTY" then
       emptyConfirm = emptyConfirm + 1
+      notFoundConfirm = 0
       if emptyConfirm >= 3 then
         safeSetEnabled(cargoUnloader, false)
         return true, "TARGET_EMPTY"
       end
     elseif ok and st == "TARGET_NOT_FOUND" then
       emptyConfirm = 0
-      safeSetEnabled(cargoUnloader, false)
-      return false, "TARGET_NOT_FOUND"
+      notFoundConfirm = notFoundConfirm + 1
+      if notFoundConfirm >= 2 then
+        safeSetEnabled(cargoUnloader, false)
+        return false, "TARGET_NOT_FOUND"
+      end
     elseif ok and st == "SUCCESS" then
       -- Don't reset confirm on SUCCESS noise.
     else
       emptyConfirm = 0
+      notFoundConfirm = 0
     end
     os.sleep(1)
   end
 
   safeSetEnabled(cargoUnloader, false)
   return false, "TIMEOUT"
+end
+
+local function enterBlocked(reason)
+  safeSetEnabled(cargoUnloader, false)
+  safeSetEnabled(cargoLoader, false)
+  missionStage = "BLOCKED_UNLOAD"
+  -- blockedSince is recorded at first unload attempt; keep it.
+  if blockedSince == 0 then
+    blockedSince = now()
+  end
+  blockedReason = reason
+  statusLine = "BLOCKED: " .. tostring(reason)
+  status("blocked:unload")
+end
+
+local function recallRocket(reason)
+  safeSetEnabled(cargoUnloader, false)
+  safeSetEnabled(cargoLoader, false)
+  missionStage = "RECALLING_HOME"
+  statusLine = "Recalling rocket"
+  status("recall:start")
+  draw()
+
+  local ok = triggerLaunchHome()
+  if ok then
+    sendHomeInbound({recall = true, reason = reason or blockedReason})
+    status("recall:home_inbound")
+    suspended = true
+    missionStage = "IDLE"
+    statusLine = "Suspended after recall"
+    currentMissionId = nil
+    returnFreq = nil
+    resetBlockedState()
+    status("suspended")
+  else
+    missionStage = "BLOCKED_UNLOAD"
+    statusLine = "Recall failed"
+    status("recall:failed")
+  end
 end
 
 local function loadRocket()
@@ -654,8 +757,20 @@ local function draw()
   print("Docked: " .. (isDocked() and "YES" or "NO"))
   print("Cells:  items=" .. tostring(ic) .. " fluids=" .. tostring(fc) .. " (>= " .. DRIVE_THRESHOLD .. ")")
   print("Stage:  " .. missionStage .. " | mission=" .. tostring(currentMissionId) .. " | returnFreq=" .. tostring(returnFreq))
+  if missionStage == "BLOCKED_UNLOAD" and blockedSince and blockedSince > 0 then
+    local remain = math.max(0, math.floor(BLOCKED_RECALL_SECONDS - (now() - blockedSince)))
+    print("Blocked: " .. tostring(blockedReason) .. " | auto recall in " .. tostring(remain) .. "s")
+  elseif suspended then
+    print("SUSPENDED: press U to unsuspend")
+  end
   print("")
-  print("Keys: F manual pickup | H manual home | Q quit")
+  if missionStage == "BLOCKED_UNLOAD" then
+    print("Keys: R retry | C recall | H manual home | Q quit")
+  elseif suspended then
+    print("Keys: U unsuspend | Q quit")
+  else
+    print("Keys: F manual pickup | H manual home | Q quit")
+  end
   print("------------------------------------------")
   print("Last sender: " .. (hqAddr or "(none)"))
   print("Status: " .. statusLine)
@@ -694,8 +809,10 @@ while true do
         if pkt.kind == "ACK" then
           -- If HQ acks our last HOME_INBOUND, stop retrying.
           local ackId = pkt.payload and pkt.payload.ack
-          if homePending and ackId and lastHomeMsgId and ackId == lastHomeMsgId then
+          if homePending and ackId and homeMsgIdMatches(ackId) then
             homePending = false
+            recentHomeMsgIds = {}
+            lastHomeExtra = nil
             statusLine = "HOME_INBOUND acked"
           end
         elseif pkt.kind == "PING" then
@@ -703,6 +820,10 @@ while true do
         elseif pkt.kind == "CMD" then
           local pl = pkt.payload
           if type(pl) == "table" and pl.missionAssigned then
+            if suspended or missionStage == "BLOCKED_UNLOAD" then
+              statusLine = suspended and "Ignored mission (suspended)" or "Ignored mission (blocked)"
+              status("mission_ignored")
+            else
             local ma = pl.missionAssigned
             if type(ma) == "table" then
               currentMissionId = ma.missionId
@@ -712,11 +833,15 @@ while true do
               missionStage = "WAIT_DOCK"
               statusLine = "Mission assigned"
               homePending = false
+              recentHomeMsgIds = {}
+              lastHomeExtra = nil
               missionProcessing = false
               missionNextAttemptAt = 0
+              resetBlockedState()
               -- Force dock transition check in case it's already docked.
               lastDocked = not isDocked()
               status("mission_assigned")
+            end
             end
           end
         else
@@ -729,8 +854,30 @@ while true do
     local ch = a2
     if ch == string.byte("q") or ch == string.byte("Q") then
       break
+    elseif ch == string.byte("u") or ch == string.byte("U") then
+      suspended = false
+      statusLine = "Unsuspended"
+      resetBlockedState()
+      status("unsuspend")
+    elseif ch == string.byte("r") or ch == string.byte("R") then
+      if missionStage == "BLOCKED_UNLOAD" then
+        blockedSince = now() -- reset 10-minute recall window
+        blockedReason = nil
+        missionStage = "WAIT_DOCK"
+        missionNextAttemptAt = 0
+        statusLine = "Retry requested"
+        status("retry")
+      end
+    elseif ch == string.byte("c") or ch == string.byte("C") then
+      if missionStage == "BLOCKED_UNLOAD" then
+        recallRocket("manual")
+      end
     elseif ch == string.byte("f") or ch == string.byte("F") then
-      requestPickup(true)
+      if not suspended then
+        requestPickup(true)
+      else
+        statusLine = "Suspended; press U"
+      end
     elseif ch == string.byte("h") or ch == string.byte("H") then
       sendHomeInbound()
     end
@@ -748,7 +895,7 @@ while true do
   end
 
   -- Auto detect buffered cells and request pickup (debounced).
-  if missionStage == "IDLE" and (not requestPending) then
+  if missionStage == "IDLE" and (not requestPending) and (not suspended) then
     if now() - lastDetectAt >= DETECT_PERIOD then
       lastDetectAt = now()
       local ic, fc = countCells()
@@ -767,6 +914,14 @@ while true do
     end
   end
 
+  -- Auto recall if blocked too long.
+  if missionStage == "BLOCKED_UNLOAD" and blockedSince and blockedSince > 0 then
+    if (now() - blockedSince) >= BLOCKED_RECALL_SECONDS then
+      recallRocket("timeout")
+      draw()
+    end
+  end
+
   -- Mission status heartbeat while active.
   if missionStage ~= "IDLE" then
     if (now() - (lastStatusAt or 0)) >= STATUS_ACTIVE_PERIOD then
@@ -779,13 +934,15 @@ while true do
   if homePending then
     if (now() - (homeFirstSendAt or 0)) > HOME_RETRY_MAX_SECONDS then
       homePending = false
+      recentHomeMsgIds = {}
+      lastHomeExtra = nil
       statusLine = "HOME_INBOUND retry timeout"
       status("home_retry_timeout")
       draw()
     elseif (now() - (lastHomeSendAt or 0)) >= HOME_RETRY_PERIOD then
       statusLine = "Retrying HOME_INBOUND"
       -- Re-broadcast using a new msgId to refresh relay queues.
-      sendHomeInbound()
+      sendHomeInbound(lastHomeExtra)
       status("home_retry")
       draw()
     end
@@ -802,8 +959,10 @@ while true do
     os.sleep(DOCK_SETTLE_SECONDS)
 
     -- unload empties from rocket into base
+    recordFirstUnloadAttempt()
     local okUn, whyUn = unloadRocket()
     if okUn then
+      resetBlockedState()
       local okLoad, why = loadRocket()
       if okLoad then
         missionStage = "LAUNCHING_HOME"
@@ -822,6 +981,7 @@ while true do
           currentMissionId = nil
           returnFreq = nil
           missionNextAttemptAt = 0
+          resetBlockedState()
         else
           statusLine = "Launch failed"
           status("launch_failed")
@@ -835,10 +995,8 @@ while true do
         missionNextAttemptAt = now() + RETRY_BACKOFF_SECONDS
       end
     else
-      statusLine = "Unload failed: " .. tostring(whyUn)
-      status("unload_failed")
-      missionStage = "WAIT_DOCK"
-      missionNextAttemptAt = now() + RETRY_BACKOFF_SECONDS
+      -- Enter blocked state; no automatic retry.
+      enterBlocked(whyUn)
     end
 
     missionProcessing = false
