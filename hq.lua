@@ -7,7 +7,7 @@ local event = require("event")
 local serialization = require("serialization")
 local term = require("term")
 
-local SCRIPT_VERSION = "0.2.0"
+local SCRIPT_VERSION = "0.2.1"
 local UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/skydaz10/oc-mission-control/main/manifest.lua"
 
 local function loadConfig()
@@ -625,6 +625,10 @@ local function handlePacket(remote, pkt)
           setMissionState(mid, "OUTPOST_UNLOADING", "outpost unloading")
         elseif st.stage == "LOADING" then
           setMissionState(mid, "OUTPOST_LOADING", "outpost loading")
+        elseif st.stage == "BLOCKED_UNLOAD" then
+          setMissionState(mid, "OUTPOST_BLOCKED_UNLOAD", "outpost blocked unload")
+        elseif st.stage == "RECALLING_HOME" then
+          setMissionState(mid, "OUTPOST_RECALLING", "outpost recalling")
         elseif st.stage == "LAUNCHING_HOME" then
           setMissionState(mid, "OUTPOST_LAUNCHING_HOME", "outpost launching home")
         end
