@@ -3,7 +3,7 @@
 -- Version must be semver: major.minor.patch
 
 return {
-  version = "0.2.6",
+  version = "0.2.7",
   targets = {
     all = {"updater.lua", "start.lua", "hq.lua", "launchcontrol.lua", "outpost.lua", "install.lua", "manifest.lua"},
     hq = {"updater.lua", "start.lua", "hq.lua", "manifest.lua"},
