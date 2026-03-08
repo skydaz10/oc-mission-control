@@ -11,7 +11,7 @@ local os = require("os")
 local serialization = require("serialization")
 local term = require("term")
 
-local SCRIPT_VERSION = "0.2.5"
+local SCRIPT_VERSION = "0.2.6"
 local UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/skydaz10/oc-mission-control/main/manifest.lua"
 
 local function loadConfig()
@@ -861,6 +861,17 @@ while true do
               lastDocked = not isDocked()
               status("mission_assigned")
             end
+            end
+          elseif type(pl) == "table" and pl.forcePickup then
+            if suspended then
+              statusLine = "Force pickup ignored (suspended)"
+              status("force_pickup_ignored_suspended")
+            elseif missionStage ~= "IDLE" or requestPending then
+              statusLine = "Force pickup ignored (busy)"
+              status("force_pickup_ignored_busy")
+            else
+              requestPickup(true)
+              status("force_pickup_requested")
             end
           end
         else

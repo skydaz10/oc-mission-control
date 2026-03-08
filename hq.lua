@@ -7,7 +7,7 @@ local event = require("event")
 local serialization = require("serialization")
 local term = require("term")
 
-local SCRIPT_VERSION = "0.2.5"
+local SCRIPT_VERSION = "0.2.6"
 local UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/skydaz10/oc-mission-control/main/manifest.lua"
 
 local function loadConfig()
@@ -75,6 +75,23 @@ local uiStatus = "Listening..."
 
 local seenMsg = {}
 local pending = {} -- msgId -> {addr=, pkt=, nextSendAt=, retries=}
+
+local okKb, keyboard = pcall(require, "keyboard")
+if not okKb then keyboard = nil end
+
+-- UI state
+local view = "main" -- main | silo_detail | outpost_detail
+local focus = "silo" -- silo | outpost
+local menuIndex = 1
+
+local function isCharKey(ch, c)
+  local b = string.byte(c)
+  return ch == b or ch == string.byte(string.upper(c))
+end
+
+local function isKeyCode(code, k)
+  return keyboard and code == keyboard.keys[k]
+end
 
 -- Prefer modem. In the relay+linked-card setup, traffic is still modem messages.
 -- Force modem for the intended topology.
@@ -191,24 +208,41 @@ local function writeAt(x, y, text)
   end
 end
 
-local function draw(status)
-  term.clear()
-
-  local w, h = 80, 25
-  if term.getViewport then
-    w, h = term.getViewport()
+local function buildHistoryLines(filterFn, limit)
+  local lines = {}
+  for mid, m in pairs(missions) do
+    if m and m.log and filterFn(m) then
+      for _, e in ipairs(m.log) do
+        local t = e.t or 0
+        lines[#lines + 1] = {t = t, s = string.format("%s %s", tostring(mid):sub(1, 8), tostring(e.msg))}
+      end
+    end
   end
+  table.sort(lines, function(a, b) return a.t > b.t end)
+  local out = {}
+  local n = math.min(#lines, limit or 10)
+  for i = 1, n do
+    out[#out + 1] = lines[i].s
+  end
+  return out
+end
+
+local function drawMain(status)
+  term.clear()
+  local w, h = 80, 25
+  if term.getViewport then w, h = term.getViewport() end
   local mid = math.floor(w / 2)
 
   writeAt(1, 1, "MISSION CONTROL HQ")
   writeAt(1, 2, "Node: " .. hqId)
   writeAt(1, 3, "Mode: " .. NET_MODE .. " | Port: " .. NET_PORT)
-  writeAt(1, 4, "Keys: W/S silo | I/K outpost | A arm | D disarm | 5 auto | X abort | P ping | M dispatch | Q quit")
-
+  writeAt(1, 4, "Keys: WASD/Arrows navigate | Enter open | Q quit")
   writeAt(1, 5, string.rep("-", w))
 
-  writeAt(1, 6, "SILOS")
-  writeAt(mid + 2, 6, "OUTPOSTS")
+  local siloHdr = (focus == "silo") and "SILOS*" or "SILOS"
+  local outHdr = (focus == "outpost") and "OUTPOSTS*" or "OUTPOSTS"
+  writeAt(1, 6, siloHdr)
+  writeAt(mid + 2, 6, outHdr)
 
   local siloListLocal = siloList()
   local outListLocal = outpostList()
@@ -231,7 +265,8 @@ local function draw(status)
       local hf = st and st.homeFreq or nil
       local hfOk = st and (st.homeFreqValid == true)
       local hfStr = tostring(hf or "?") .. (hfOk and "" or "!")
-      local line = string.format("%s %d) %s | %s %s %s %s | hf=%s | %.1fs", mark, i, sid, armed, auto, busy, dock, hfStr, seen)
+      local midShort = st and st.missionId and tostring(st.missionId):sub(1, 6) or ""
+      local line = string.format("%s %d) %s | %s %s %s %s | hf=%s | %s | %.1fs", mark, i, sid, armed, auto, busy, dock, hfStr, midShort, seen)
       writeAt(1, y, line:sub(1, mid - 1))
     end
 
@@ -242,13 +277,18 @@ local function draw(status)
       local oid = (e and e.nodeId) or oAddr
       local seen = e and (now() - (e.lastSeen or 0)) or 999
       local info = e and e.info or nil
+      local st = e and e.state or nil
       local pf = info and info.padFreq or nil
       local planet = info and info.planetName or nil
       local pfOk = info and (info.padFreqValid == true)
       local req = requests[oid]
       local reqStr = req and (req.status or "REQ") or "--"
       local pfStr = tostring(pf or "?") .. (pfOk and "" or "!")
-      local line = string.format("%s %d) %s | %s | f=%s | %.1fs", mark, i, oid, tostring(planet or "?"), pfStr, seen)
+      local stage = st and st.stage or nil
+      local susp = st and st.suspended == true
+      local stageStr = stage and tostring(stage) or "--"
+      if susp then stageStr = stageStr .. " SUSP" end
+      local line = string.format("%s %d) %s | %s | f=%s | %s | %.1fs", mark, i, oid, tostring(planet or "?"), pfStr, stageStr, seen)
       if req then line = line .. " | " .. reqStr end
       writeAt(mid + 2, y, line:sub(1, w - (mid + 1)))
     end
@@ -257,9 +297,9 @@ local function draw(status)
   -- Mission panel (last few by lastUpdateAt)
   local mlineY = h - 6
   local list = {}
-  for mid, m in pairs(missions) do
+  for mid2, m in pairs(missions) do
     if m and m.state and m.state ~= "COMPLETE" and m.state ~= "ABORTED" then
-      table.insert(list, {mid = mid, t = m.lastUpdateAt or m.createdAt or 0})
+      table.insert(list, {mid = mid2, t = m.lastUpdateAt or m.createdAt or 0})
     end
   end
   table.sort(list, function(a, b) return a.t > b.t end)
@@ -278,8 +318,137 @@ local function draw(status)
   end
 
   writeAt(1, h - 2, string.rep("-", w))
-
   writeAt(1, h - 1, "Status: " .. tostring(status or uiStatus or "Ready"))
+end
+
+local function drawSiloDetail(status)
+  term.clear()
+  local w, h = 80, 25
+  if term.getViewport then w, h = term.getViewport() end
+  local mid = math.floor(w / 2)
+  local addr = selectedAddr()
+  local e = addr and silos[addr] or nil
+  local sid = (e and e.nodeId) or (addr or "(none)")
+  local st = e and e.state or {}
+  local seen = e and (now() - (e.lastSeen or 0)) or 999
+
+  writeAt(1, 1, "SILO: " .. tostring(sid))
+  writeAt(1, 2, "Keys: W/S move | Enter select | Backspace/Esc back | Q quit")
+  writeAt(1, 3, string.rep("-", w))
+
+  -- Left: state + history
+  writeAt(1, 4, "STATE")
+  writeAt(1, 5, string.format("Seen: %.1fs", seen))
+  writeAt(1, 6, string.format("Armed: %s", st.armed and "YES" or "NO"))
+  writeAt(1, 7, string.format("AUTO:  %s", st.autoStandby and "WAITING" or "OFF"))
+  writeAt(1, 8, string.format("Busy:  %s", st.busy and "YES" or "NO"))
+  writeAt(1, 9, string.format("Docked:%s", st.docked and "YES" or "NO"))
+  local hfStr = tostring(st.homeFreq or "?") .. ((st.homeFreqValid == true) and "" or "!")
+  writeAt(1, 10, "HomeFreq: " .. hfStr)
+  writeAt(1, 11, "Mission: " .. tostring(st.missionId or st.lastMissionId or "--"))
+  writeAt(1, 12, "Result:  " .. tostring(st.lastMissionResult or "--"))
+
+  writeAt(1, 14, "HISTORY")
+  local hist = buildHistoryLines(function(m)
+    return m.siloId and tostring(m.siloId) == tostring(sid)
+  end, h - 17)
+  for i = 1, (h - 17) do
+    local y = 14 + i
+    local line = hist[i] or ""
+    writeAt(1, y, line:sub(1, mid - 2))
+  end
+
+  -- Right: controls
+  writeAt(mid + 2, 4, "CONTROLS")
+  local menu = {
+    "Arm",
+    "Disarm",
+    "AUTO standby",
+    "Abort",
+    "Ping",
+    "Back",
+  }
+  for i = 1, #menu do
+    local y = 4 + i
+    local mark = (i == menuIndex) and ">" or " "
+    writeAt(mid + 2, y, (mark .. " " .. menu[i]):sub(1, w - (mid + 1)))
+  end
+
+  writeAt(1, h - 2, string.rep("-", w))
+  writeAt(1, h - 1, "Status: " .. tostring(status or uiStatus or "Ready"))
+end
+
+local function drawOutpostDetail(status)
+  term.clear()
+  local w, h = 80, 25
+  if term.getViewport then w, h = term.getViewport() end
+  local mid = math.floor(w / 2)
+  local addr = selectedOutpostAddr()
+  local e = addr and outposts[addr] or nil
+  local oid = (e and e.nodeId) or (addr or "(none)")
+  local seen = e and (now() - (e.lastSeen or 0)) or 999
+  local info = e and e.info or {}
+  local st = e and e.state or {}
+  local pfStr = tostring(info.padFreq or "?") .. ((info.padFreqValid == true) and "" or "!")
+  local req = requests[oid]
+
+  writeAt(1, 1, "OUTPOST: " .. tostring(oid))
+  writeAt(1, 2, "Keys: W/S move | Enter select | Backspace/Esc back | Q quit")
+  writeAt(1, 3, string.rep("-", w))
+
+  -- Left: state
+  writeAt(1, 4, "STATE")
+  writeAt(1, 5, "Planet: " .. tostring(info.planetName or "?"))
+  writeAt(1, 6, "Seen:   " .. string.format("%.1fs", seen))
+  writeAt(1, 7, "Pad f:  " .. pfStr)
+  writeAt(1, 8, "Stage:  " .. tostring(st.stage or "--"))
+  writeAt(1, 9, "Susp:   " .. ((st.suspended == true) and "YES" or "NO"))
+  if st.blockedReason then
+    writeAt(1, 10, "Block:  " .. tostring(st.blockedReason))
+  end
+  if st.itemCells ~= nil and st.fluidCells ~= nil then
+    writeAt(1, 11, string.format("Cells:  ic=%s fc=%s", tostring(st.itemCells), tostring(st.fluidCells)))
+  end
+  if req then
+    writeAt(1, 12, "Req:    " .. tostring(req.status or "--"))
+  end
+
+  writeAt(1, 14, "HISTORY")
+  local hist = buildHistoryLines(function(m)
+    return m.outpostId and tostring(m.outpostId) == tostring(oid)
+  end, h - 17)
+  for i = 1, (h - 17) do
+    local y = 14 + i
+    local line = hist[i] or ""
+    writeAt(1, y, line:sub(1, mid - 2))
+  end
+
+  -- Right: actions
+  writeAt(mid + 2, 4, "ACTIONS")
+  local pickupEnabled = (st.suspended ~= true)
+  local menu = {
+    {label = "Manual pickup request", enabled = pickupEnabled},
+    {label = "Back", enabled = true},
+  }
+  for i = 1, #menu do
+    local y = 4 + i
+    local mark = (i == menuIndex) and ">" or " "
+    local text = menu[i].label
+    if not menu[i].enabled then text = text .. " (disabled)" end
+    writeAt(mid + 2, y, (mark .. " " .. text):sub(1, w - (mid + 1)))
+  end
+
+  writeAt(1, h - 2, string.rep("-", w))
+  writeAt(1, h - 1, "Status: " .. tostring(status or uiStatus or "Ready"))
+end
+
+local function draw(status)
+  if view == "silo_detail" then
+    return drawSiloDetail(status)
+  elseif view == "outpost_detail" then
+    return drawOutpostDetail(status)
+  end
+  return drawMain(status)
 end
 
 local function missionLog(mid, msg)
@@ -781,36 +950,135 @@ while true do
     draw()
   elseif ev == "key_down" then
     local ch = a2
-    if ch == string.byte("q") or ch == string.byte("Q") then
+    local code = a3
+
+    if isCharKey(ch, "q") then
       break
-    elseif ch == string.byte("w") or ch == string.byte("W") then
-      selectedSilo = selectedSilo - 1
-    elseif ch == string.byte("s") or ch == string.byte("S") then
-      selectedSilo = selectedSilo + 1
-    elseif ch == string.byte("i") or ch == string.byte("I") then
-      selectedOutpost = selectedOutpost - 1
-    elseif ch == string.byte("k") or ch == string.byte("K") then
-      selectedOutpost = selectedOutpost + 1
-    elseif ch == string.byte("a") or ch == string.byte("A") then
-      queueCmd(selectedAddr(), {arm = true})
-    elseif ch == string.byte("d") or ch == string.byte("D") then
-      queueCmd(selectedAddr(), {arm = false})
-    elseif ch == string.byte("5") then
-      queueCmd(selectedAddr(), {autoStart = true})
-    elseif ch == string.byte("x") or ch == string.byte("X") then
-      queueCmd(selectedAddr(), {abort = true})
-    elseif ch == string.byte("p") or ch == string.byte("P") then
-      local addr = selectedAddr()
-      if addr then sendPkt(addr, {kind = "PING", msgId = msgId(), payload = {}}) end
-    elseif ch == string.byte("m") or ch == string.byte("M") then
-      -- manually dispatch selected outpost (if it has a pending request)
-      local oAddr = selectedOutpostAddr()
-      local oid = oAddr and outposts[oAddr] and outposts[oAddr].nodeId
-      if oid then
-        local ok, msg = dispatchPickup(oid)
-        uiStatus = (ok and "Dispatch: " or "Dispatch blocked: ") .. tostring(msg)
-      end
     end
+
+    local up = isCharKey(ch, "w") or isKeyCode(code, "up")
+    local down = isCharKey(ch, "s") or isKeyCode(code, "down")
+    local left = isCharKey(ch, "a") or isKeyCode(code, "left")
+    local right = isCharKey(ch, "d") or isKeyCode(code, "right")
+    local enter = (type(ch) == "number" and ch == 13) or isKeyCode(code, "enter") or isKeyCode(code, "numpadenter")
+    local back = (type(ch) == "number" and ch == 8) or isKeyCode(code, "back") or isKeyCode(code, "backspace") or isKeyCode(code, "escape")
+
+    if view == "main" then
+      if left then
+        focus = "silo"
+      elseif right then
+        focus = "outpost"
+      elseif up then
+        if focus == "silo" then
+          selectedSilo = selectedSilo - 1
+        else
+          selectedOutpost = selectedOutpost - 1
+        end
+      elseif down then
+        if focus == "silo" then
+          selectedSilo = selectedSilo + 1
+        else
+          selectedOutpost = selectedOutpost + 1
+        end
+      elseif enter then
+        if focus == "silo" then
+          local addr = selectedAddr()
+          if addr then
+            view = "silo_detail"
+            menuIndex = 1
+          else
+            uiStatus = "No silo selected"
+          end
+        else
+          local addr = selectedOutpostAddr()
+          if addr then
+            view = "outpost_detail"
+            menuIndex = 1
+          else
+            uiStatus = "No outpost selected"
+          end
+        end
+      end
+    elseif view == "silo_detail" then
+      local menuLen = 6
+      if back then
+        view = "main"
+        menuIndex = 1
+      elseif up then
+        menuIndex = menuIndex - 1
+      elseif down then
+        menuIndex = menuIndex + 1
+      elseif enter then
+        local addr = selectedAddr()
+        if not addr then
+          uiStatus = "No silo selected"
+          view = "main"
+        else
+          if menuIndex == 1 then
+            queueCmd(addr, {arm = true})
+            uiStatus = "Sent arm"
+          elseif menuIndex == 2 then
+            queueCmd(addr, {arm = false})
+            uiStatus = "Sent disarm"
+          elseif menuIndex == 3 then
+            queueCmd(addr, {autoStart = true})
+            uiStatus = "Sent AUTO standby"
+          elseif menuIndex == 4 then
+            queueCmd(addr, {abort = true})
+            uiStatus = "Sent abort"
+          elseif menuIndex == 5 then
+            sendPkt(addr, {kind = "PING", msgId = msgId(), payload = {}})
+            uiStatus = "Ping sent"
+          elseif menuIndex == 6 then
+            view = "main"
+            menuIndex = 1
+          end
+        end
+      end
+      if menuIndex < 1 then menuIndex = 1 end
+      if menuIndex > menuLen then menuIndex = menuLen end
+    elseif view == "outpost_detail" then
+      local menuLen = 2
+      if back then
+        view = "main"
+        menuIndex = 1
+      elseif up then
+        menuIndex = menuIndex - 1
+      elseif down then
+        menuIndex = menuIndex + 1
+      elseif enter then
+        local addr = selectedOutpostAddr()
+        local e = addr and outposts[addr] or nil
+        local oid = (e and e.nodeId) or nil
+        local st = e and e.state or nil
+        if menuIndex == 1 then
+          if not addr or not oid then
+            uiStatus = "No outpost selected"
+          elseif st and st.suspended == true then
+            uiStatus = "Outpost suspended; fix locally"
+          else
+            queueToNode(addr, "CMD", {forcePickup = {manual = true}}, {type = "forcePickup", outpostId = oid})
+            uiStatus = "Force pickup sent to " .. tostring(oid)
+          end
+        elseif menuIndex == 2 then
+          view = "main"
+          menuIndex = 1
+        end
+      end
+      if menuIndex < 1 then menuIndex = 1 end
+      if menuIndex > menuLen then menuIndex = menuLen end
+    end
+
+    -- clamp selections
+    local sN = #siloList()
+    if selectedSilo < 1 then selectedSilo = 1 end
+    if selectedSilo > sN then selectedSilo = sN end
+    if selectedSilo < 1 then selectedSilo = 1 end
+    local oN = #outpostList()
+    if selectedOutpost < 1 then selectedOutpost = 1 end
+    if selectedOutpost > oN then selectedOutpost = oN end
+    if selectedOutpost < 1 then selectedOutpost = 1 end
+
     draw()
   end
 end
