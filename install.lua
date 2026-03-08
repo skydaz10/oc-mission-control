@@ -11,7 +11,7 @@ local filesystem = require("filesystem")
 local serialization = require("serialization")
 local term = require("term")
 
-local INSTALLER_VERSION = "0.2.4"
+local INSTALLER_VERSION = "0.2.5"
 
 local function safeGetLabel()
   if type(computer.getLabel) ~= "function" then return "" end
@@ -176,7 +176,7 @@ local function install()
   term.clear()
   print("Downloading scripts...")
 
-  local files = {"updater.lua", "manifest.lua"}
+  local files = {"updater.lua", "manifest.lua", "start.lua"}
   if role == "hq" then
     table.insert(files, "hq.lua")
   elseif role == "silo" then
@@ -189,14 +189,6 @@ local function install()
   local cfgText = "return " .. serialization.serialize(cfg) .. "\n"
   local ok, err = writeFile("/home/node_config.lua", cfgText)
   if not ok then error("failed node_config.lua: " .. tostring(err)) end
-
-  local start = "local cfg = dofile('/home/node_config.lua')\n" ..
-                "if cfg.role == 'hq' then dofile('/home/hq.lua')\n" ..
-                "elseif cfg.role == 'silo' then dofile('/home/launchcontrol.lua')\n" ..
-                "elseif cfg.role == 'outpost' then dofile('/home/outpost.lua')\n" ..
-                "else io.stderr:write('unknown role\n') end\n"
-  ok, err = writeFile("/home/start.lua", start)
-  if not ok then error("failed start.lua: " .. tostring(err)) end
 
   ok, err = setAutorun("/home/start.lua")
   if not ok then error("failed autorun.lua: " .. tostring(err)) end
