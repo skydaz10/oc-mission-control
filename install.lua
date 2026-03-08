@@ -8,10 +8,11 @@ local component = require("component")
 local computer = require("computer")
 local event = require("event")
 local filesystem = require("filesystem")
+local os = require("os")
 local serialization = require("serialization")
 local term = require("term")
 
-local INSTALLER_VERSION = "0.2.5"
+local INSTALLER_VERSION = "0.2.8"
 
 local function safeGetLabel()
   if type(computer.getLabel) ~= "function" then return "" end
@@ -25,7 +26,40 @@ local function safeSetLabel(lbl)
   return pcall(computer.setLabel, lbl)
 end
 
-local REPO_RAW_BASE = "https://raw.githubusercontent.com/skydaz10/oc-mission-control/installer/"
+local DEFAULT_CHANNEL = "main"
+
+local function branchBase(branch)
+  return "https://raw.githubusercontent.com/skydaz10/oc-mission-control/" .. tostring(branch) .. "/"
+end
+
+local function parseArgs(...)
+  local res = {channel = nil, noSelfUpdate = false}
+  local args = {...}
+  for i = 1, #args do
+    local a = args[i]
+    if a == "--no-self-update" then
+      res.noSelfUpdate = true
+    elseif a == "--channel" then
+      local v = args[i + 1]
+      if type(v) == "string" and v ~= "" then
+        res.channel = v
+      end
+    elseif type(a) == "string" and a:match("^%-%-channel=") then
+      res.channel = a:match("^%-%-channel=(.+)$")
+    end
+  end
+  return res
+end
+
+local function readFile(path)
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local d = f:read("*a")
+  f:close()
+  return d
+end
+
+local REPO_RAW_BASE = nil
 
 local function httpGet(url)
   if not component.isAvailable("internet") then
@@ -56,6 +90,24 @@ local function writeFile(path, content)
   f:write(content)
   f:close()
   return true
+end
+
+local function selfUpdateInstaller(branch)
+  local url = branchBase(branch) .. "install.lua"
+  local body, err = httpGet(url)
+  if not body then
+    return false, "self-update fetch failed: " .. tostring(err)
+  end
+  local localPath = "/home/install.lua"
+  local cur = readFile(localPath)
+  if cur == body then
+    return true, "already current"
+  end
+  local okW, werr = writeFile(localPath, body)
+  if not okW then
+    return false, "self-update write failed: " .. tostring(werr)
+  end
+  return true, "updated"
 end
 
 local function fetchTo(url, path)
@@ -97,6 +149,11 @@ local function promptChoice(title, choices)
   end
 end
 
+local function chooseChannel()
+  local idx = promptChoice("Select update channel", {"Stable (main)", "Dev (dev)"})
+  return (idx == 2) and "dev" or "main"
+end
+
 local function setAutorun(startPath)
   filesystem.setAutorunEnabled(true)
   local autorun = "-- oc-mission-control autorun\n" ..
@@ -104,9 +161,10 @@ local function setAutorun(startPath)
   return writeFile("/autorun.lua", autorun)
 end
 
-local function showChecklist(role)
+local function showChecklist(role, channel)
   term.clear()
   print("oc-mission-control installer " .. tostring(INSTALLER_VERSION))
+  print("Channel: " .. tostring(channel))
   print("")
   print("Preflight checklist (" .. tostring(role) .. ")")
   print("-")
@@ -142,17 +200,22 @@ local function downloadFiles(list)
   end
 end
 
-local function install()
+local function install(channel)
   if not component.isAvailable("internet") then
     error("No internet card found.")
   end
+
+  if type(channel) ~= "string" or channel == "" then
+    channel = DEFAULT_CHANNEL
+  end
+  REPO_RAW_BASE = branchBase(channel)
 
   local roleIdx = promptChoice("Install oc-mission-control", {"HQ", "Silo", "Outpost"})
   local role = ({"hq", "silo", "outpost"})[roleIdx]
 
   local cfg = {
     role = role,
-    UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/skydaz10/oc-mission-control/installer/manifest.lua",
+    UPDATE_MANIFEST_URL = branchBase(channel) .. "manifest.lua",
   }
 
   local labelDefault = safeGetLabel()
@@ -171,7 +234,7 @@ local function install()
     if outpostId and outpostId ~= "" then safeSetLabel(outpostId) end
   end
 
-  showChecklist(role)
+  showChecklist(role, channel)
 
   term.clear()
   print("Downloading scripts...")
@@ -201,4 +264,32 @@ local function install()
   computer.shutdown(true)
 end
 
-install()
+local opts = parseArgs(...)
+local channel = opts.channel
+if not channel then
+  channel = chooseChannel()
+end
+
+if not opts.noSelfUpdate then
+  if not component.isAvailable("internet") then
+    error("No internet card found.")
+  end
+  local okUp, msg = selfUpdateInstaller(channel)
+  if okUp and msg == "updated" then
+    term.clear()
+    print("Installer updated. Restarting...")
+    os.sleep(0.5)
+    local cmd = "lua /home/install.lua --channel " .. tostring(channel) .. " --no-self-update"
+    local okShell, shell = pcall(require, "shell")
+    if okShell and shell and shell.execute then
+      shell.execute(cmd)
+    elseif os.execute then
+      os.execute(cmd)
+    else
+      error("cannot restart installer; run: " .. cmd)
+    end
+    return
+  end
+end
+
+install(channel)
