@@ -11,6 +11,8 @@ local filesystem = require("filesystem")
 local serialization = require("serialization")
 local term = require("term")
 
+local INSTALLER_VERSION = "0.2.4"
+
 local function safeGetLabel()
   if type(computer.getLabel) ~= "function" then return "" end
   local ok, v = pcall(computer.getLabel)
@@ -102,6 +104,44 @@ local function setAutorun(startPath)
   return writeFile("/autorun.lua", autorun)
 end
 
+local function showChecklist(role)
+  term.clear()
+  print("oc-mission-control installer " .. tostring(INSTALLER_VERSION))
+  print("")
+  print("Preflight checklist (" .. tostring(role) .. ")")
+  print("-")
+  print("Required: Internet Card (for install/update)")
+  print("Required: Network Card (modem) on port 4242")
+  if role == "outpost" then
+    print("Required: cargo_launch_controller + cargo_loader + cargo_unloader + transposer")
+    print("Required: transposer adjacent to cargo loader inventory (inventoryName=tile.cargo)")
+    print("Important: only ONE cargo_loader/unloader in computer range")
+    print("Important: pad source frequency must be valid (set in-world)")
+    print("Behavior: unload timeout ~90s -> BLOCKED; auto recall after 10 min; R resets timer")
+    print("Config: /home/node_config.lua supports UNLOAD_TIMEOUT, BLOCKED_RECALL_SECONDS")
+  elseif role == "silo" then
+    print("Required: redstone I/O + cargo_launch_controller + cargo_loader + cargo_unloader")
+    print("Recommended: me_controller for mission preflight replacement empties")
+    print("Important: home pad source frequency must be valid (set in-world)")
+    print("Important: BLUE bundled wire is manual fallback HOME signal")
+  elseif role == "hq" then
+    print("Required: Network Card (modem) + screen/keyboard")
+    print("Important: keep HQ on same relay network as silos/outposts")
+  end
+  print("")
+  local s = promptLine("Type INSTALL to continue", "")
+  if (s or ""):upper() ~= "INSTALL" then
+    error("install cancelled")
+  end
+end
+
+local function downloadFiles(list)
+  for _, rel in ipairs(list) do
+    local ok, err = fetchTo(REPO_RAW_BASE .. rel, "/home/" .. rel)
+    if not ok then error("failed " .. tostring(rel) .. ": " .. tostring(err)) end
+  end
+end
+
 local function install()
   if not component.isAvailable("internet") then
     error("No internet card found.")
@@ -131,24 +171,23 @@ local function install()
     if outpostId and outpostId ~= "" then safeSetLabel(outpostId) end
   end
 
+  showChecklist(role)
+
   term.clear()
   print("Downloading scripts...")
 
-  local ok, err
-  ok, err = fetchTo(REPO_RAW_BASE .. "updater.lua", "/home/updater.lua")
-  if not ok then error("failed updater.lua: " .. tostring(err)) end
-  ok, err = fetchTo(REPO_RAW_BASE .. "manifest.lua", "/home/manifest.lua")
-  if not ok then error("failed manifest.lua: " .. tostring(err)) end
-  ok, err = fetchTo(REPO_RAW_BASE .. "hq.lua", "/home/hq.lua")
-  if not ok then error("failed hq.lua: " .. tostring(err)) end
-  ok, err = fetchTo(REPO_RAW_BASE .. "launchcontrol.lua", "/home/launchcontrol.lua")
-  if not ok then error("failed launchcontrol.lua: " .. tostring(err)) end
-  ok, err = fetchTo(REPO_RAW_BASE .. "outpost.lua", "/home/outpost.lua")
-  if not ok then error("failed outpost.lua: " .. tostring(err)) end
-  -- outpost_moon.lua removed; outpost.lua is the only entrypoint.
+  local files = {"updater.lua", "manifest.lua"}
+  if role == "hq" then
+    table.insert(files, "hq.lua")
+  elseif role == "silo" then
+    table.insert(files, "launchcontrol.lua")
+  elseif role == "outpost" then
+    table.insert(files, "outpost.lua")
+  end
+  downloadFiles(files)
 
   local cfgText = "return " .. serialization.serialize(cfg) .. "\n"
-  ok, err = writeFile("/home/node_config.lua", cfgText)
+  local ok, err = writeFile("/home/node_config.lua", cfgText)
   if not ok then error("failed node_config.lua: " .. tostring(err)) end
 
   local start = "local cfg = dofile('/home/node_config.lua')\n" ..
