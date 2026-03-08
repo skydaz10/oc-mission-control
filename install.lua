@@ -11,6 +11,18 @@ local filesystem = require("filesystem")
 local serialization = require("serialization")
 local term = require("term")
 
+local function safeGetLabel()
+  if type(computer.getLabel) ~= "function" then return "" end
+  local ok, v = pcall(computer.getLabel)
+  if ok and type(v) == "string" then return v end
+  return ""
+end
+
+local function safeSetLabel(lbl)
+  if type(computer.setLabel) ~= "function" then return false end
+  return pcall(computer.setLabel, lbl)
+end
+
 local REPO_RAW_BASE = "https://raw.githubusercontent.com/skydaz10/oc-mission-control/installer/"
 
 local function httpGet(url)
@@ -103,20 +115,20 @@ local function install()
     UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/skydaz10/oc-mission-control/installer/manifest.lua",
   }
 
-  local labelDefault = computer.getLabel() or ""
+  local labelDefault = safeGetLabel()
   if role == "hq" then
     local lbl = promptLine("Computer label", labelDefault)
-    if lbl and lbl ~= "" then pcall(computer.setLabel, lbl) end
+    if lbl and lbl ~= "" then safeSetLabel(lbl) end
   elseif role == "silo" then
     local siloId = promptLine("Silo ID (label)", (labelDefault ~= "" and labelDefault or "SILO_01"))
     cfg.SILO_ID = siloId
-    if siloId and siloId ~= "" then pcall(computer.setLabel, siloId) end
+    if siloId and siloId ~= "" then safeSetLabel(siloId) end
   elseif role == "outpost" then
     local outpostId = promptLine("Outpost ID (label)", (labelDefault ~= "" and labelDefault or "MOON_01"))
     local planet = promptLine("Planet name", "Moon")
     cfg.OUTPOST_ID = outpostId
     cfg.PLANET_NAME = planet
-    if outpostId and outpostId ~= "" then pcall(computer.setLabel, outpostId) end
+    if outpostId and outpostId ~= "" then safeSetLabel(outpostId) end
   end
 
   term.clear()
