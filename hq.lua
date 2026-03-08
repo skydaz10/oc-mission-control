@@ -7,7 +7,7 @@ local event = require("event")
 local serialization = require("serialization")
 local term = require("term")
 
-local SCRIPT_VERSION = "0.2.7"
+local SCRIPT_VERSION = "0.2.8"
 local UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/skydaz10/oc-mission-control/main/manifest.lua"
 
 local function loadConfig()
