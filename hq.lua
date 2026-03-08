@@ -7,7 +7,7 @@ local event = require("event")
 local serialization = require("serialization")
 local term = require("term")
 
-local SCRIPT_VERSION = "0.2.6"
+local SCRIPT_VERSION = "0.2.7"
 local UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/skydaz10/oc-mission-control/main/manifest.lua"
 
 local function loadConfig()
@@ -83,6 +83,27 @@ if not okKb then keyboard = nil end
 local view = "main" -- main | silo_detail | outpost_detail
 local focus = "silo" -- silo | outpost
 local menuIndex = 1
+
+local nodeOps = {} -- nodeId -> {{t=, msg=}, ...}
+
+local function logNodeOp(nodeId, msg)
+  if not nodeId or msg == nil then return end
+  local l = nodeOps[nodeId]
+  if not l then
+    l = {}
+    nodeOps[nodeId] = l
+  end
+  table.insert(l, 1, {t = now(), msg = tostring(msg)})
+  if #l > 10 then
+    table.remove(l)
+  end
+end
+
+local function lastNodeOp(nodeId)
+  local l = nodeId and nodeOps[nodeId] or nil
+  if l and l[1] and l[1].msg then return l[1].msg end
+  return "--"
+end
 
 local function isCharKey(ch, c)
   local b = string.byte(c)
@@ -333,7 +354,7 @@ local function drawSiloDetail(status)
   local seen = e and (now() - (e.lastSeen or 0)) or 999
 
   writeAt(1, 1, "SILO: " .. tostring(sid))
-  writeAt(1, 2, "Keys: W/S move | Enter select | Backspace/Esc back | Q quit")
+  writeAt(1, 2, "Keys: W/S move | Enter select | Backspace back | Q quit")
   writeAt(1, 3, string.rep("-", w))
 
   -- Left: state + history
@@ -347,6 +368,7 @@ local function drawSiloDetail(status)
   writeAt(1, 10, "HomeFreq: " .. hfStr)
   writeAt(1, 11, "Mission: " .. tostring(st.missionId or st.lastMissionId or "--"))
   writeAt(1, 12, "Result:  " .. tostring(st.lastMissionResult or "--"))
+  writeAt(1, 13, "LastOp:  " .. lastNodeOp(sid))
 
   writeAt(1, 14, "HISTORY")
   local hist = buildHistoryLines(function(m)
@@ -393,7 +415,7 @@ local function drawOutpostDetail(status)
   local req = requests[oid]
 
   writeAt(1, 1, "OUTPOST: " .. tostring(oid))
-  writeAt(1, 2, "Keys: W/S move | Enter select | Backspace/Esc back | Q quit")
+  writeAt(1, 2, "Keys: W/S move | Enter select | Backspace back | Q quit")
   writeAt(1, 3, string.rep("-", w))
 
   -- Left: state
@@ -412,6 +434,7 @@ local function drawOutpostDetail(status)
   if req then
     writeAt(1, 12, "Req:    " .. tostring(req.status or "--"))
   end
+  writeAt(1, 13, "LastOp: " .. lastNodeOp(oid))
 
   writeAt(1, 14, "HISTORY")
   local hist = buildHistoryLines(function(m)
@@ -425,7 +448,7 @@ local function drawOutpostDetail(status)
 
   -- Right: actions
   writeAt(mid + 2, 4, "ACTIONS")
-  local pickupEnabled = (st.suspended ~= true)
+  local pickupEnabled = (st.suspended ~= true) and (st.stage == nil or st.stage == "IDLE")
   local menu = {
     {label = "Manual pickup request", enabled = pickupEnabled},
     {label = "Back", enabled = true},
@@ -961,7 +984,7 @@ while true do
     local left = isCharKey(ch, "a") or isKeyCode(code, "left")
     local right = isCharKey(ch, "d") or isKeyCode(code, "right")
     local enter = (type(ch) == "number" and ch == 13) or isKeyCode(code, "enter") or isKeyCode(code, "numpadenter")
-    local back = (type(ch) == "number" and ch == 8) or isKeyCode(code, "back") or isKeyCode(code, "backspace") or isKeyCode(code, "escape")
+    local back = (type(ch) == "number" and ch == 8) or isKeyCode(code, "back") or isKeyCode(code, "backspace")
 
     if view == "main" then
       if left then
@@ -1014,21 +1037,28 @@ while true do
           uiStatus = "No silo selected"
           view = "main"
         else
+          local e = silos[addr]
+          local sid = (e and e.nodeId) or addr
           if menuIndex == 1 then
             queueCmd(addr, {arm = true})
             uiStatus = "Sent arm"
+            logNodeOp(sid, "arm")
           elseif menuIndex == 2 then
             queueCmd(addr, {arm = false})
             uiStatus = "Sent disarm"
+            logNodeOp(sid, "disarm")
           elseif menuIndex == 3 then
             queueCmd(addr, {autoStart = true})
             uiStatus = "Sent AUTO standby"
+            logNodeOp(sid, "auto standby")
           elseif menuIndex == 4 then
             queueCmd(addr, {abort = true})
             uiStatus = "Sent abort"
+            logNodeOp(sid, "abort")
           elseif menuIndex == 5 then
             sendPkt(addr, {kind = "PING", msgId = msgId(), payload = {}})
             uiStatus = "Ping sent"
+            logNodeOp(sid, "ping")
           elseif menuIndex == 6 then
             view = "main"
             menuIndex = 1
@@ -1056,9 +1086,12 @@ while true do
             uiStatus = "No outpost selected"
           elseif st and st.suspended == true then
             uiStatus = "Outpost suspended; fix locally"
+          elseif st and st.stage and st.stage ~= "IDLE" then
+            uiStatus = "Outpost busy"
           else
             queueToNode(addr, "CMD", {forcePickup = {manual = true}}, {type = "forcePickup", outpostId = oid})
             uiStatus = "Force pickup sent to " .. tostring(oid)
+            logNodeOp(oid, "force pickup")
           end
         elseif menuIndex == 2 then
           view = "main"

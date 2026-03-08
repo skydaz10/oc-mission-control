@@ -870,8 +870,11 @@ while true do
               statusLine = "Force pickup ignored (busy)"
               status("force_pickup_ignored_busy")
             else
-              requestPickup(true)
-              status("force_pickup_requested")
+              local okReq = requestPickup(true)
+              if okReq then
+                statusLine = "Force pickup requested"
+                status("force_pickup_requested")
+              end
             end
           end
         else
