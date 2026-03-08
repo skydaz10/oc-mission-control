@@ -145,8 +145,7 @@ local function install()
   if not ok then error("failed launchcontrol.lua: " .. tostring(err)) end
   ok, err = fetchTo(REPO_RAW_BASE .. "outpost.lua", "/home/outpost.lua")
   if not ok then error("failed outpost.lua: " .. tostring(err)) end
-  ok, err = fetchTo(REPO_RAW_BASE .. "outpost_moon.lua", "/home/outpost_moon.lua")
-  if not ok then error("failed outpost_moon.lua: " .. tostring(err)) end
+  -- outpost_moon.lua removed; outpost.lua is the only entrypoint.
 
   local cfgText = "return " .. serialization.serialize(cfg) .. "\n"
   ok, err = writeFile("/home/node_config.lua", cfgText)

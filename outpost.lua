@@ -6,11 +6,12 @@
 local component = require("component")
 local computer = require("computer")
 local event = require("event")
+local filesystem = require("filesystem")
 local os = require("os")
 local serialization = require("serialization")
 local term = require("term")
 
-local SCRIPT_VERSION = "0.2.2"
+local SCRIPT_VERSION = "0.2.3"
 local UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/skydaz10/oc-mission-control/main/manifest.lua"
 
 local function loadConfig()
@@ -776,7 +777,25 @@ local function draw()
   print("Status: " .. statusLine)
 end
 
+local function cleanupLegacyOutpostMoon()
+  local path = "/home/outpost_moon.lua"
+  if not filesystem.exists(path) then return end
+  local ok, body = pcall(function()
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local d = f:read("*a")
+    f:close()
+    return d
+  end)
+  if not ok or type(body) ~= "string" then return end
+  -- Only remove if it looks like the old wrapper.
+  if body:find("dofile(\"/home/outpost.lua\")", 1, true) or body:find("dofile('/home/outpost.lua')", 1, true) then
+    pcall(filesystem.remove, path)
+  end
+end
+
 -- init
+cleanupLegacyOutpostMoon()
 pcall(function()
   local up = dofile("/home/updater.lua")
   if up and up.run then up.run({manifestUrl = UPDATE_MANIFEST_URL, currentVersion = SCRIPT_VERSION, target = "outpost"}) end
